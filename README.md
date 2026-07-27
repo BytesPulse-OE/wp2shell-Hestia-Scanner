@@ -61,6 +61,32 @@ wp --info
 
 ---
 
+## One-liner install & run
+
+Download and run directly from GitHub — no cloning needed.
+
+### Fast IoC scan (`wp2shell-scan.sh`)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BytesPulse-OE/wp2shell-Hestia-Scanner/main/wp2shell-scan.sh | sudo bash
+```
+
+### Full scan with email reports (`wp2shell-report-per-user.sh`)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BytesPulse-OE/wp2shell-Hestia-Scanner/main/wp2shell-report-per-user.sh | sudo bash
+```
+
+> **Note:** The full scanner asks two interactive questions at startup (AI evaluation, save report).
+> If piping to bash prevents the prompts from appearing, download first then run:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/BytesPulse-OE/wp2shell-Hestia-Scanner/main/wp2shell-report-per-user.sh -o wp2shell-report-per-user.sh
+> sudo bash wp2shell-report-per-user.sh
+> ```
+
+---
+
 ## Quick start
 
 ### 1. wp2shell-scan.sh — fast server-wide IoC scan
@@ -267,7 +293,7 @@ Lines prefixed `-` are from the **clean core**, lines prefixed `+` are from the 
 
 ## License
 
-MIT
+GPL-3.0 — see [LICENSE](LICENSE)
 
 ---
 
