@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
 # wp2shell-report-per-user.sh
-# Read-only ανιχνευτής wp2shell ΑΝΑ HestiaCP user + core diff + email στον user.
+# Read-only wp2shell scanner per HestiaCP user + core diff + email report.
 #
-# - Δεν αλλάζει τίποτα στα sites (μόνο διαβάζει).
-# - Για κάθε user: σαρώνει τα WP sites του, κάνει diff με καθαρό πυρήνα,
-#   ελέγχει PHP/JS/HTML/htaccess/εικόνες για malicious signatures & νέα αρχεία,
-#   και στέλνει ένα email με τα ευρήματα στο CONTACT email του Hestia.
+# - Never modifies anything on sites (read-only throughout).
+# - For each user: scans their WP sites, diffs against clean core,
+#   checks PHP/JS/HTML/htaccess/images for malicious signatures & new files,
+#   and sends a findings email to the HestiaCP CONTACT address of each user.
 #
-# Χρήση:  sudo bash wp2shell-report-per-user.sh
+# Usage:  sudo bash wp2shell-report-per-user.sh
 #
-# ΠΡΟΣΟΧΗ: ξεκίνα με DRY_RUN=1 (default) για να δεις τα emails στην οθόνη
-#          ΠΡΙΝ σταλούν πραγματικά σε πελάτες.
+# WARNING: start with DRY_RUN=1 (default) to preview emails on screen
+#          BEFORE sending them to real clients.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail
 
-# --- Ρυθμίσεις ---------------------------------------------------------------
+# --- Settings ---------------------------------------------------------------
 HESTIA="/usr/local/hestia"
 USERS_DIR="$HESTIA/data/users"
 CORE_CACHE="/root/wp2shell-cores"        # cache clean cores per version+locale
@@ -98,10 +98,10 @@ echo ""
 # Global: dangerous PHP patterns -- used by scan_site AND scan_files
 DANGER_PATTERNS='eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|gzuncompress\s*\(|gzdecode\s*\(|assert\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|php://input|create_function\s*\(|preg_replace.*\/e[^a-z]|move_uploaded_file\s*\(|str_rot13\s*\('
 
-# wp-cli ως owner (χωρίς plugins/themes για ταχύτητα & ασφάλεια)
+# Run wp-cli as site owner (no plugins/themes for speed & safety)
 run_wp() { local owner="$1" path="$2"; shift 2; sudo -u "$owner" -- "$WP" --path="$path" --skip-plugins --skip-themes "$@" 2>/dev/null; }
 
-# Κατεβάζει (μια φορά) καθαρό core για version+locale στο cache, ως root
+# Download (once) clean core for version+locale to cache, as root
 ensure_clean_core() {
   local ver="$1" loc="$2" dir="$CORE_CACHE/${ver}-${loc}"
   if [ ! -f "$dir/wp-load.php" ]; then
@@ -115,8 +115,8 @@ ensure_clean_core() {
 }
 
 # ---------------------------------------------------------------------------
-# scan_files: ελέγχει PHP/JS/HTML/htaccess/εικόνες για malicious content.
-# Καλείται από scan_site — τυπώνει στο stdout, επιστρέφει 1 αν βρεθεί κάτι.
+# scan_files: checks PHP/JS/HTML/htaccess/images for malicious content.
+# Called from scan_site -- prints to stdout, returns 1 if anything found.
 # ---------------------------------------------------------------------------
 scan_files() {
   local WPP="$1" issues=0
@@ -124,8 +124,8 @@ scan_files() {
 
   echo "  -- File scan (PHP/JS/HTML/.htaccess/images) --"
 
-  # A) ΕΠΙΠΛΕΟΝ PHP EXTENSIONS — αρχεία που ο Apache/Nginx εκτελεί ως PHP
-  #    (.php7 .phtml .phar .php5 .shtml) — δεν ανήκουν σε κανονικό WP site
+  # A) EXTRA PHP EXTENSIONS -- files Apache/Nginx executes as PHP
+  #    (.php7 .phtml .phar .php5 .shtml) -- never belong in a normal WP site
   local xphp
   xphp="$(find "$WPP" -type f \( \
             -name '*.php7' -o -name '*.phtml' -o -name '*.phar' \
@@ -137,9 +137,9 @@ scan_files() {
     issues=1
   fi
 
-  # B) PHP SIGNATURES — eval/assert/base64/shell κ.λπ.
-  #    Ψάχνουμε σε ολόκληρο το site (plugins, themes, uploads, root).
-  #    Εξαιρούμε wp-includes & wp-admin γιατί καλύπτονται από core diff/checksums.
+  # B) PHP SIGNATURES -- eval/assert/base64/shell etc.
+  #    Search entire site (plugins, themes, uploads, root).
+  #    Exclude wp-includes & wp-admin -- covered by core diff/checksums.
   local php_sig
   php_sig="$(grep -RIlE --include='*.php' "$DANGER_PATTERNS" \
       "$CONTENT" "$WPP"/*.php 2>/dev/null \
@@ -148,7 +148,7 @@ scan_files() {
   if [ -n "$php_sig" ]; then
     echo "  [?] PHP with suspicious patterns (check context -- possible false positives):"
     echo "$php_sig" | sed 's/^/       /'
-    # Ξεχωρίζουμε αρχεία στο uploads/ — εκεί δεν δικαιολογούνται ποτέ
+    # Separate uploads/ hits -- PHP never belongs there
     local php_sig_up
     php_sig_up="$(echo "$php_sig" | grep '/uploads/')"
     if [ -n "$php_sig_up" ]; then
@@ -158,12 +158,12 @@ scan_files() {
     fi
   fi
 
-  # C) .HTACCESS — επικίνδυνα directives (με διάκριση protective vs malicious)
+  # C) .HTACCESS -- dangerous directives (distinguishes protective vs malicious)
   local htaccess_files
   mapfile -t htaccess_files < <(find "$WPP" -name '.htaccess' -type f 2>/dev/null)
   for hta in "${htaccess_files[@]}"; do
-    # ΚΙΝΔΥΝΟΣ: AddType (εκτελεί άλλες extensions ως PHP), auto_prepend/append (inject),
-    #           RewriteRule σε uploads ή εξωτερικό URL
+    # DANGER: AddType (executes other extensions as PHP), auto_prepend/append (inject),
+    #           RewriteRule pointing to uploads or external URL
     local hta_danger
     hta_danger="$(grep -inE \
       'AddType\s+application/x-httpd-php|auto_prepend_file|auto_append_file|php_value\s+auto_prepend|RewriteRule.*uploads.*\.(php|phtml|phar)|RewriteRule.*http[s]?://' \
@@ -174,14 +174,14 @@ scan_files() {
       issues=1
     fi
 
-    # ΠΡΟΣΤΑΤΕΥΤΙΚΟ (OK): php_flag engine off — μπλοκάρει εκτέλεση PHP, βάζεται από plugins
+    # PROTECTIVE (OK): php_flag engine off -- blocks PHP execution, set by plugins
     local hta_protective
     hta_protective="$(grep -inE 'php_flag\s+engine\s+off' "$hta" 2>/dev/null)"
     if [ -n "$hta_protective" ]; then
       echo "  [ok] Protective directive in ${hta#$WPP/} (php_flag engine off -- normal, set by plugins like Sucuri/WPForms)"
     fi
 
-    # ΕΝΗΜΕΡΩΤΙΚΟ: άλλα php_flag/php_value που δεν είναι engine off
+    # INFORMATIONAL: other php_flag/php_value entries that are not engine off
     local hta_phpflag
     hta_phpflag="$(grep -inE 'php_flag|php_value' "$hta" 2>/dev/null \
                   | grep -ivE 'php_flag\s+engine\s+off')"
@@ -191,9 +191,9 @@ scan_files() {
     fi
   done
 
-  # D) JS/HTML — signatures malicious JavaScript
+  # D) JS/HTML -- malicious JavaScript signatures
   #    eval(atob(...)) / document.write(unescape(...)) / obfuscated hex strings /
-  #    εξωτερικά src που φορτώνουν script από άγνωστο domain
+  #    external src loading scripts from unknown domains
   local js_sig
   js_sig="$(grep -RIlE --include='*.js' --include='*.html' --include='*.htm' \
       'eval\s*\(\s*atob\s*\(|eval\s*\(\s*unescape\s*\(|document\.write\s*\(\s*unescape|String\.fromCharCode\s*\([0-9,\s]{40,}\)|\\\\x[0-9a-f]{2}\\\\x[0-9a-f]{2}\\\\x[0-9a-f]{2}|fetch\s*\(\s*['"'"'"][^'"'"'"]{0,5}https?://[^/]|src\s*=\s*['"'"'"]https?://(?!ajax\.googleapis|cdnjs\.cloudflare|code\.jquery|cdn\.jsdelivr|fonts\.googleapis|use\.fontawesome)' \
@@ -204,8 +204,8 @@ scan_files() {
     issues=1
   fi
 
-  # E) ΝΕΑ/ΤΡΟΠΟΠΟΙΗΜΕΝΑ αρχεία μετά τις 15/07/2026
-  #    PHP — εκτός wp-includes & wp-admin (αυτά τα βλέπει το core diff)
+  # E) NEW/MODIFIED files after 15/07/2026
+  #    PHP -- excluding wp-includes & wp-admin (covered by core diff)
   local new_php
   new_php="$(find "$CONTENT" "$WPP"/*.php 2>/dev/null \
               -type f -name '*.php' -newermt '2026-07-15' \
@@ -215,7 +215,7 @@ scan_files() {
     echo "$new_php" | sed 's/^/       /'
   }
 
-  #    JS/HTML — νέα ή τροποποιημένα
+  #    JS/HTML -- new or modified
   local new_js
   new_js="$(find "$CONTENT" -type f \( -name '*.js' -o -name '*.html' -o -name '*.htm' \) \
               -newermt '2026-07-15' \
@@ -225,7 +225,7 @@ scan_files() {
     echo "$new_js" | sed 's/^/       /'
   }
 
-  #    .htaccess τροποποιημένα
+  #    .htaccess -- modified
   local new_hta
   new_hta="$(find "$WPP" -name '.htaccess' -newermt '2026-07-15' \
               -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null)"
@@ -235,8 +235,8 @@ scan_files() {
     issues=1
   }
 
-  # F) ΕΙΚΟΝΕΣ ΜΕ PHP PAYLOAD — polyglot αρχεία
-  #    Ψάχνουμε για το literal "<?php" μέσα σε jpg/png/gif/ico/webp
+  # F) IMAGES WITH PHP PAYLOAD -- polyglot files
+  #    Search for literal "<?php" inside jpg/png/gif/ico/webp
   local img_php
   img_php="$(grep -RIla --include='*.jpg' --include='*.jpeg' \
                --include='*.png' --include='*.gif' --include='*.ico' \
@@ -248,7 +248,7 @@ scan_files() {
     issues=1
   fi
 
-  # G) ΕΚΤΕΘΕΙΜΕΝΑ BACKUP/CONFIG αρχεία — προσβάσιμα μέσω browser
+  # G) EXPOSED BACKUP/CONFIG files -- web-accessible
   local exposed
   exposed="$(find "$WPP" -maxdepth 2 -type f \( \
                -name 'wp-config.php.bak' -o -name 'wp-config.old' \
@@ -264,11 +264,11 @@ scan_files() {
   return $issues
 }
 
-# Σαρώνει ΕΝΑ site και τυπώνει το κείμενο ευρημάτων στο stdout.
-# Επιστρέφει 0 αν καθαρό, 1 αν βρέθηκε κάτι.
+# Scans ONE site and prints findings to stdout.
+# Returns 0 if clean, 1 if anything found.
 scan_site() {
   local owner="$1" WPP="$2" issues=0
-  echo "──────────────────────────────────────────────"
+  echo "----------------------------------------------"
   echo "SITE: $WPP"
 
   local ver; ver="$(run_wp "$owner" "$WPP" core version)"
@@ -284,7 +284,7 @@ scan_site() {
       echo "  [!] VULNERABLE version -- update to 6.8.6 / 6.9.5 / 7.0.2+"; issues=1 ;;
   esac
 
-  # 1) Αποτυπώματα λογαριασμών
+  # 1) Account fingerprints
   local bad
   bad="$(run_wp "$owner" "$WPP" user list --fields=ID,user_login,user_email,user_registered,roles --format=csv \
          | grep -Ei 'wp2_[0-9a-f]{6,}|@wp2shell\.invalid')"
@@ -292,7 +292,7 @@ scan_site() {
     echo "  [!] wp2shell fingerprint accounts found:"; echo "$bad" | sed 's/^/       /'; issues=1
   fi
 
-  # 2) Admins μετά τη γνωστοποίηση (15/07/2026)
+  # 2) Admins created after disclosure (15/07/2026)
   local newadm
   newadm="$(run_wp "$owner" "$WPP" user list --role=administrator \
             --fields=ID,user_login,user_email,user_registered --format=csv \
@@ -301,19 +301,19 @@ scan_site() {
     echo "  [!] New admins created after disclosure (15/07/2026):"; echo "$newadm" | sed 's/^/       /'; issues=1
   fi
 
-  # 3) Orphaned usermeta / κενά user-ID
+  # 3) Orphaned usermeta / gaps in user-ID sequence
   local orphan
   orphan="$(run_wp "$owner" "$WPP" db query \
     "SELECT COUNT(*) FROM wp_usermeta um LEFT JOIN wp_users u ON um.user_id=u.ID WHERE u.ID IS NULL;" \
     --skip-column-names)"
   [ "${orphan:-0}" -gt 0 ] 2>/dev/null && { echo "  [!] Orphaned usermeta rows: $orphan"; issues=1; }
 
-  # 4) PHP σε uploads
+  # 4) PHP files in uploads
   local phpup
   phpup="$(find "$WPP/wp-content/uploads" -type f -name '*.php' 2>/dev/null)"
   [ -n "$phpup" ] && { echo "  [!] PHP files inside uploads/:"; echo "$phpup" | sed 's/^/       /'; issues=1; }
 
-  # 5) Core checksums (locale-aware, από wp.org)
+  # 5) Core checksums (locale-aware, from wp.org)
   local cks
   cks="$(run_wp "$owner" "$WPP" core verify-checksums 2>&1)"
   if echo "$cks" | grep -qi 'Success'; then
@@ -323,7 +323,7 @@ scan_site() {
     echo "$cks" | grep -Ei 'Warning|does not|should not' | sed 's/^/       /'; issues=1
   fi
 
-  # 6) CORE DIFF — γραμμή-γραμμή με αξιολόγηση ανά αρχείο
+  # 6) CORE DIFF -- line-by-line with per-file evaluation
   local loc clean
   loc="$(run_wp "$owner" "$WPP" eval 'echo get_locale();')"; loc="${loc:-en_US}"
   clean="$(ensure_clean_core "$ver" "$loc")"
@@ -331,7 +331,7 @@ scan_site() {
   if [ ! -f "$clean/wp-load.php" ]; then
     echo "  [?] Could not download clean core for diff (version/locale)."
   else
-    # Λίστα αρχείων που διαφέρουν (modified) ή είναι επιπλέον (extra)
+    # List files that differ (modified) or are extra (not in clean core)
     local changed_files extra_files
     mapfile -t changed_files < <(
       diff -rq "$clean" "$WPP" \
@@ -348,16 +348,16 @@ scan_site() {
       | grep -vE 'Only in .*/wp-content' \
       | grep "^Only in $WPP" \
       | while IFS= read -r line; do
-          # Μορφή: "Only in /path/to/dir: filename"
-          # Εξάγουμε τον φάκελο και το αρχείο ξεχωριστά
+          # Format: "Only in /path/to/dir: filename"
+          # Extract directory and filename separately
           dir="${line#Only in }";  dir="${dir%%: *}"
           file="${line##*: }"
-          # Relative path ως προς το WPP (αφαιρούμε το WPP prefix + trailing slash)
+          # Relative path from WPP root (strip WPP prefix + trailing slash)
           rel_dir="${dir#$WPP}"; rel_dir="${rel_dir#/}"
           if [ -z "$rel_dir" ]; then
-            echo "$file"           # αρχείο απευθείας στο root
+            echo "$file"           # file directly in root
           else
-            echo "$rel_dir/$file"  # αρχείο σε υποφάκελο
+            echo "$rel_dir/$file"  # file in subdirectory
           fi
         done
     )
@@ -367,33 +367,33 @@ scan_site() {
     else
       echo "  -- Core diff: ${#changed_files[@]} modified, ${#extra_files[@]} extra files --"
 
-      # --- Τροποποιημένα αρχεία πυρήνα: diff -U5 + αξιολόγηση ----------------
+      # --- Modified core files: diff -U5 + evaluation -----------------------
       for rel in "${changed_files[@]}"; do
         local orig="$clean/$rel" site_file="$WPP/$rel"
         echo ""
         echo "  ┌─ MODIFIED: $rel"
 
-        # Παράγουμε το unified diff (5 γραμμές context)
+        # Generate unified diff (5 lines of context)
         local udiff
         udiff="$(diff -U5 "$orig" "$site_file" 2>/dev/null)"
 
-        # Εξάγουμε μόνο τις γραμμές που άλλαξαν (+/-) για αξιολόγηση
+        # Extract only changed lines (+/-) for evaluation
         local added removed
         added="$(echo "$udiff"   | grep '^+' | grep -v '^+++')"
         removed="$(echo "$udiff" | grep '^-' | grep -v '^---')"
 
-        # --- Βήμα 1: Pattern evaluation ---------------------------------------
+        # --- Step 1: Pattern evaluation --------------------------------------
         local verdict=""
         local pattern_matched=0
 
-        # ΕΠΙΚΙΝΔΥΝΑ patterns στις γραμμές που ΠΡΟΣΤΕΘΗΚΑΝ (χρήση global DANGER_PATTERNS)
+        # DANGEROUS patterns in ADDED lines (uses global DANGER_PATTERNS)
         if echo "$added" | grep -qiE "$DANGER_PATTERNS"; then
-          verdict="ΚΙΝΔΥΝΟΣ"
+          verdict="DANGER"
           pattern_matched=1
           echo "  │  [!] Assessment (patterns): [DANGER] -- executable/obfuscated pattern found in added lines"
         fi
 
-        # ΑΣΦΑΛΗ patterns: μόνο whitespace/comment/version string αλλαγές
+        # SAFE: only whitespace/comment/version string changes
         if [ "$pattern_matched" -eq 0 ]; then
           local non_trivial
           non_trivial="$(echo "$added" | grep -v '^+[[:space:]]*$' \
@@ -409,11 +409,11 @@ scan_site() {
           fi
         fi
 
-        # --- Βήμα 2: AI evaluation (μόνο αν τα patterns δεν αποφάνθηκαν) -----
+        # --- Step 2: AI evaluation (only when patterns are inconclusive) ------
         if [ "$pattern_matched" -eq 0 ] && [ "$USE_AI" -eq 1 ] && command -v curl >/dev/null 2>&1; then
           echo "  │  [...] Assessment (AI) -- sending diff to Claude API..."
           local ai_prompt ai_response ai_verdict ai_reason
-          ai_prompt="Είσαι security analyst. Εξέτασε το παρακάτω unified diff ενός αρχείου WordPress core. Απάντα ΜΟΝΟ σε JSON: {\"verdict\": \"ΚΙΝΔΥΝΟΣ\" ή \"ΥΠΟΠΤΟ\" ή \"OK\", \"reason\": \"μία πρόταση στα ελληνικά\"}. Μην γράψεις τίποτα άλλο.\n\nΑρχείο: $rel\nDiff:\n$udiff"
+          ai_prompt="You are a WordPress security analyst. Review the following unified diff of a WordPress core file. Respond ONLY with JSON, no other text: {\"verdict\": \"DANGER\" or \"SUSPICIOUS\" or \"OK\", \"reason\": \"one sentence in English\"}. \n\nFile: $rel\nDiff:\n$udiff"
           ai_response="$(curl -sf --max-time 15 --connect-timeout 5 \
             -X POST "https://api.anthropic.com/v1/messages" \
             -H "Content-Type: application/json" \
@@ -431,17 +431,17 @@ scan_site() {
             verdict="$ai_verdict"
           else
             echo "  │  [?] Assessment (AI): [FAILED] -- no response, check manually"
-            verdict="ΕΛΕΓΞΕ"
+            verdict="REVIEW"
           fi
         elif [ "$pattern_matched" -eq 0 ]; then
           echo "  │  [?] Assessment (AI): [SKIPPED] -- AI disabled, check manually"
-          verdict="ΕΛΕΓΞΕ"
+          verdict="REVIEW"
         fi
 
-        # Αν είναι ΚΙΝΔΥΝΟΣ ή ΥΠΟΠΤΟ → σημείωσε για το email
-        case "$verdict" in ΚΙΝΔΥΝΟΣ|ΥΠΟΠΤΟ|ΕΛΕΓΞΕ) issues=1 ;; esac
+        # If DANGER or SUSPICIOUS → flag for the email
+        case "$verdict" in DANGER|SUSPICIOUS|REVIEW) issues=1 ;; esac
 
-        # Τυπώνουμε το diff με prefix για ευαναγνωσία
+        # Print diff with prefix for readability
         echo "  │"
         echo "  │  ORIGINAL: $clean/$rel";
         echo "  │  SITE:     $site_file"
@@ -455,19 +455,19 @@ scan_site() {
         echo "  └──────────────────────────────────────"
       done
 
-      # --- Επιπλέον αρχεία (δεν ανήκουν στον πυρήνα) -------------------------
+      # --- Extra files (not part of clean core) ------------------------------
       for rel in "${extra_files[@]}"; do
         local extra_file="$WPP/$rel"
         echo ""
         echo "  ┌─ EXTRA: $rel"
 
-        # Μεταδεδομένα αρχείου
+        # File metadata
         if [ -e "$extra_file" ]; then
           local fsize fdate ftype
           fsize="$(du -sh "$extra_file" 2>/dev/null | cut -f1)"
           fdate="$(stat -c '%y' "$extra_file" 2>/dev/null | cut -d'.' -f1)"
           if [ -d "$extra_file" ]; then
-            ftype="ΦΑΚΕΛΟΣ"
+            ftype="DIRECTORY"
           else
             ftype="$(file -b "$extra_file" 2>/dev/null | cut -c1-60)"
           fi
@@ -479,7 +479,7 @@ scan_site() {
           continue
         fi
 
-        # Φακέλους — μόνο listing, χωρίς ανάλυση περιεχομένου
+        # Directories -- listing only, no content analysis
         if [ -d "$extra_file" ]; then
           echo "  │  Directory listing:"
           ls -la "$extra_file" 2>/dev/null | head -20 | sed 's/^/  │    /'
@@ -490,7 +490,7 @@ scan_site() {
 
         local ext="${extra_file##*.}"; ext="${ext,,}"
 
-        # ZIP / αρχεία — περιεχόμενα χωρίς αποσυμπίεση
+        # ZIP / archives -- contents without extraction
         if [[ "$ext" == "zip" || "$ext" == "gz" || "$ext" == "tar" ]]; then
           echo "  │"
           echo "  │  Archive listing:"
@@ -505,12 +505,12 @@ scan_site() {
           continue
         fi
 
-        # HTML — εμφάνιση περιεχομένου, χωρίς PHP ανάλυση
+        # HTML -- show content, no PHP analysis
         if [[ "$ext" == "html" || "$ext" == "htm" ]]; then
           echo "  │"
           echo "  │  Content:"
           cat "$extra_file" 2>/dev/null | head -20 | sed 's/^/  │    /'
-          # Google verification files — γνωστό pattern
+          # Google verification files -- known safe pattern
           if grep -qiE 'google-site-verification|google\.com/webmasters' "$extra_file" 2>/dev/null; then
             echo "  │  [ok] Assessment: [OK] -- Google Search Console verification file"
           else
@@ -521,29 +521,29 @@ scan_site() {
           continue
         fi
 
-        # PHP / εκτελέσιμα αρχεία — πλήρης ανάλυση
-        # Αποφεύγουμε null bytes: ελέγχουμε αν είναι binary πριν διαβάσουμε σε variable
+        # PHP / executable files -- full analysis
+        # Avoid null bytes: check if binary before reading into variable
         local extra_content=""
         if file "$extra_file" 2>/dev/null | grep -qE 'text|ASCII|UTF'; then
           extra_content="$(head -100 "$extra_file" 2>/dev/null)"
         else
-          # Binary αρχείο — εξάγουμε μόνο printable strings για pattern check
+          # Binary file -- extract printable strings only for pattern check
           extra_content="$(strings "$extra_file" 2>/dev/null | head -100)"
           echo "  │  [i] Binary file -- analysing via strings(1)"
         fi
 
         if echo "$extra_content" | grep -qiE "$DANGER_PATTERNS"; then
           echo "  │  [!] Assessment (patterns): [DANGER] -- executable/obfuscated pattern detected"
-          # Δείξε ακριβώς ποιες γραμμές είναι ύποπτες
+          # Show exactly which lines are suspicious
           echo "  │  Suspicious lines:"
           grep -nEi "$DANGER_PATTERNS" "$extra_file" 2>/dev/null | head -10 | sed 's/^/  │    >> /'
           issues=1
         elif echo "$extra_content" | grep -qiE '<\?php'; then
-          # PHP χωρίς άμεσα ύποπτα patterns → AI
+          # PHP without immediately suspicious patterns -> AI
           if [ "$USE_AI" -eq 1 ] && command -v curl >/dev/null 2>&1; then
             echo "  │  [...] Assessment (AI) -- PHP file outside core, waiting for verdict..."
             local ex_prompt ex_resp ex_v ex_r
-            ex_prompt="Είσαι security analyst. Εξέτασε αυτό το PHP αρχείο που βρέθηκε στον WordPress πυρήνα αλλά ΔΕΝ ανήκει στον επίσημο πυρήνα. Απάντα ΜΟΝΟ σε JSON: {\"verdict\": \"ΚΙΝΔΥΝΟΣ\" ή \"ΥΠΟΠΤΟ\" ή \"OK\", \"reason\": \"μία πρόταση στα ελληνικά\"}.\n\nΑρχείο: $rel\nΠεριεχόμενο (πρώτες 100 γραμμές):\n$extra_content"
+            ex_prompt="You are a WordPress security analyst. Review this PHP file found in the WordPress directory but NOT part of the official core. Respond ONLY with JSON, no other text: {\"verdict\": \"DANGER\" or \"SUSPICIOUS\" or \"OK\", \"reason\": \"one sentence in English\"}.\n\nFile: $rel\nContent (first 100 lines):\n$extra_content"
             ex_resp="$(curl -sf --max-time 15 --connect-timeout 5 \
               -X POST "https://api.anthropic.com/v1/messages" \
               -H "Content-Type: application/json" \
@@ -556,7 +556,7 @@ scan_site() {
             if [ -n "$ex_resp" ]; then
               ex_v="${ex_resp%%|||*}"; ex_r="${ex_resp##*|||}"
               echo "  │  [AI] Assessment: [$ex_v] -- $ex_r"
-              case "$ex_v" in ΚΙΝΔΥΝΟΣ|ΥΠΟΠΤΟ) issues=1 ;; esac
+              case "$ex_v" in DANGER|SUSPICIOUS) issues=1 ;; esac
             else
               echo "  │  [?] Assessment (AI): [FAILED] -- check manually"
               issues=1
@@ -569,7 +569,7 @@ scan_site() {
           echo "  │  [ok] Assessment (patterns): [OK] -- no PHP or suspicious code"
         fi
 
-        # Εμφάνιση περιεχομένου
+        # Print file content
         echo "  │"
         echo "  │  Content (first 40 lines):"
         head -40 "$extra_file" 2>/dev/null | sed 's/^/  │    /'
@@ -580,35 +580,35 @@ scan_site() {
     fi
   fi
 
-  # 7) Πρόσφατα core PHP (νεότερα από 15/07/2026)
+  # 7) Recently modified core PHP (newer than 15/07/2026)
   local rec
   rec="$(find "$WPP/wp-admin" "$WPP/wp-includes" -name '*.php' -newermt '2026-07-15' 2>/dev/null \
          -printf '%TY-%Tm-%Td %TH:%TM  %p\n' | head -30)"
   [ -n "$rec" ] && { echo "  [?] Core PHP modified after 15/07/2026:"; echo "$rec" | sed 's/^/       /'; }
 
-  # 8) Εκτεταμένος έλεγχος αρχείων: PHP/JS/HTML/htaccess/εικόνες/backups
+  # 8) Extended file scan: PHP/JS/HTML/htaccess/images/backups
   scan_files "$WPP" || issues=1
 
   return $issues
 }
 
-# --- Κύριος βρόχος: ανά user -------------------------------------------------
+# --- Main loop: per user ----------------------------------------------------
 mapfile -t USERS < <(ls -1 "$USERS_DIR" 2>/dev/null)
 
 for user in "${USERS[@]}"; do
   conf="$USERS_DIR/$user/user.conf"
   [ -f "$conf" ] || continue
 
-  # email πελάτη από το Hestia (πεδίο CONTACT)
+  # Client email from Hestia CONTACT field
   contact="$(grep -oP "CONTACT='\K[^']+" "$conf")"
 
-  # WP installs του user
+  # WP installs for this user
   mapfile -t SITES < <(find "/home/$user/web" -maxdepth 4 -name wp-load.php -type f 2>/dev/null \
                        | xargs -r -n1 dirname | sort -u)
   [ "${#SITES[@]}" -eq 0 ] && continue
 
   echo "===================================================================="
-  echo "USER: $user   →   $contact   (${#SITES[@]} WP sites)"
+  echo "USER: $user  ->  $contact  (${#SITES[@]} WP sites)"
 
   body_file="$(mktemp)"
   domains=""
@@ -630,7 +630,7 @@ for user in "${USERS[@]}"; do
   done
 
   {
-    echo "──────────────────────────────────────────────"
+    echo "----------------------------------------------"
     if [ "$user_issues" -eq 1 ]; then
       echo "SUMMARY: potential indicators found -- review required."
     else
@@ -641,7 +641,7 @@ for user in "${USERS[@]}"; do
     echo "-- BytesPulse security scan (automated)"
   } >> "$body_file"
 
-  # Αποστολή ή προεπισκόπηση
+  # Send or preview
   if [ "$SEND_ONLY_IF_ISSUES" -eq 1 ] && [ "$user_issues" -eq 0 ]; then
     echo "  (clean -- email not sent, SEND_ONLY_IF_ISSUES=1)"
     rm -f "$body_file"; continue
@@ -668,10 +668,10 @@ for user in "${USERS[@]}"; do
       echo
       cat "$body_file"
     } | "$SENDMAIL" -t -f "$MAIL_FROM"
-    echo "  [sent] → $contact"
+    echo "  [sent] -> $contact"
   fi
 
-  # Αποθήκευση στο συνολικό report (αν ζητήθηκε)
+  # Append to full report file (if requested)
   if [ -n "$REPORT_FILE" ]; then
     {
       echo ""
