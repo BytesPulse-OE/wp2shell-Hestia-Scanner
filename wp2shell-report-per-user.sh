@@ -20,7 +20,9 @@ set -uo pipefail
 HESTIA="/usr/local/hestia"
 USERS_DIR="$HESTIA/data/users"
 CORE_CACHE="/root/wp2shell-cores"        # cache clean cores per version+locale
-DAYS_MODIFIED=30
+# Date threshold for "recently modified" checks (wp2shell disclosure date).
+# Change to narrow or widen the window. Format: YYYY-MM-DD
+SINCE_DATE="2026-07-15"
 WP="wp"
 
 DRY_RUN=1                                # 1 = preview only, 0 = send emails
@@ -37,6 +39,18 @@ ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 [ "$(id -u)" -eq 0 ] || { echo "Run as root (sudo)."; exit 1; }
 command -v "$WP" >/dev/null 2>&1 || { echo "wp-cli not found."; exit 1; }
 mkdir -p "$CORE_CACHE"
+
+# Severity colors
+RED=$'\e[31m'; RED_BOLD=$'\e[1;31m'; YEL=$'\e[33m'
+BLU=$'\e[34m'; GRN=$'\e[32m'; GRY=$'\e[90m'; RST=$'\e[0m'
+
+# Severity prefixes -- used throughout scan output
+SEV_CRITICAL="${RED_BOLD}[CRITICAL]${RST}"
+SEV_HIGH="${RED}[HIGH]    ${RST}"
+SEV_MEDIUM="${YEL}[MEDIUM]  ${RST}"
+SEV_LOW="${BLU}[LOW]     ${RST}"
+SEV_INFO="${GRY}[INFO]    ${RST}"
+SEV_OK="${GRN}[OK]      ${RST}"
 
 echo ""
 echo "+------------------------------------------------------+"
@@ -95,8 +109,89 @@ case "${save_choice,,}" in
 esac
 echo ""
 
+# --- Q3: Date threshold ---
+echo "+------------------------------------------------------+"
+echo "|           DATE THRESHOLD                            |"
+echo "+------------------------------------------------------+"
+echo "  Default: $SINCE_DATE (wp2shell disclosure date)"
+read -r -p "  Use a different date? Leave blank to keep default [YYYY-MM-DD]: " date_choice </dev/tty
+if [[ "$date_choice" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  SINCE_DATE="$date_choice"
+  echo "  -> Using custom date: $SINCE_DATE"
+else
+  echo "  -> Using default: $SINCE_DATE"
+fi
+echo ""
+
 # Global: dangerous PHP patterns -- used by scan_site AND scan_files
 DANGER_PATTERNS='eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|gzuncompress\s*\(|gzdecode\s*\(|assert\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|php://input|create_function\s*\(|preg_replace.*\/e[^a-z]|move_uploaded_file\s*\(|str_rot13\s*\('
+
+# External C2 / exfiltration domains to flag inside PHP/JS/HTML
+C2_PATTERNS='pastebin\.com/raw|gist\.github\.com/raw|raw\.githubusercontent\.com|t\.me/|discord(app)?\.com/api/webhooks|ngrok\.io|ngrok-free\.app|tinyurl\.com|bit\.ly/[a-zA-Z0-9]|cdn\.discordapp\.com'
+
+# Known webshell SHA256 hashes (subset of most common shells)
+# Source: https://github.com/Neo23x0/signature-base + manual curation
+KNOWN_SHELLS_FILE="/root/wp2shell-known-shells.sha256"
+
+# Download/refresh known shells hash list (once per day)
+fetch_known_shells() {
+  local url="https://raw.githubusercontent.com/BytesPulse-OE/wp2shell-Hestia-Scanner/main/known_shells.sha256"
+  local age=99999
+  [ -f "$KNOWN_SHELLS_FILE" ] && age=$(( $(date +%s) - $(stat -c %Y "$KNOWN_SHELLS_FILE") ))
+  if [ ! -f "$KNOWN_SHELLS_FILE" ] || [ "$age" -gt 86400 ]; then
+    echo "  Fetching known webshell hash database..."
+    curl -sf --max-time 10 --connect-timeout 5 "$url" -o "$KNOWN_SHELLS_FILE" 2>/dev/null \
+      || echo "  [INFO] Could not fetch hash DB -- SHA256 check skipped."
+  fi
+}
+fetch_known_shells
+
+# Check a single file against known shell hashes
+# Returns: shell name if matched, empty string otherwise
+check_known_shell() {
+  local f="$1"
+  [ -f "$KNOWN_SHELLS_FILE" ] || return
+  local hash; hash="$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"
+  [ -z "$hash" ] && return
+  grep -i "^$hash" "$KNOWN_SHELLS_FILE" 2>/dev/null | head -1 | awk '{print $2}'
+}
+
+# ---------------------------------------------------------------------------
+# Risk scoring -- accumulate points per site, print summary at end of scan_site
+# Usage: score_add <points> <reason>
+# Call score_reset at start of each site, score_report at end.
+# ---------------------------------------------------------------------------
+SITE_SCORE=0
+SITE_SCORE_LOG=""
+
+score_reset() {
+  SITE_SCORE=0
+  SITE_SCORE_LOG=""
+}
+
+score_add() {
+  local pts="$1" reason="$2"
+  SITE_SCORE=$(( SITE_SCORE + pts ))
+  SITE_SCORE_LOG="${SITE_SCORE_LOG}  $(printf '%+d' "$pts")  $reason\n"
+}
+
+score_report() {
+  local domain="$1"
+  local label color
+  if   [ "$SITE_SCORE" -ge 81 ]; then label="COMPROMISED";  color="$RED_BOLD"
+  elif [ "$SITE_SCORE" -ge 61 ]; then label="HIGH RISK";    color="$RED"
+  elif [ "$SITE_SCORE" -ge 41 ]; then label="MEDIUM RISK";  color="$YEL"
+  elif [ "$SITE_SCORE" -ge 21 ]; then label="LOW RISK";     color="$BLU"
+  else                                 label="PROBABLY CLEAN"; color="$GRN"
+  fi
+  echo ""
+  echo "  ┌─────────────────────────────────────────┐"
+  printf  "  │  RISK SCORE: %s%-6s%s  %-16s    │\n" "$color" "$SITE_SCORE/100" "$RST" "$label"
+  echo "  │                                         │"
+  printf '%b' "$SITE_SCORE_LOG" | sed 's/^/  │/' | head -15
+  echo "  └─────────────────────────────────────────┘"
+  echo ""
+}
 
 # Run wp-cli as site owner (no plugins/themes for speed & safety)
 run_wp() { local owner="$1" path="$2"; shift 2; sudo -u "$owner" -- "$WP" --path="$path" --skip-plugins --skip-themes "$@" 2>/dev/null; }
@@ -132,120 +227,147 @@ scan_files() {
             -o -name '*.php5' -o -name '*.shtml' \
           \) 2>/dev/null)"
   if [ -n "$xphp" ]; then
-    echo "  [!] Files with executable PHP extensions (.php7/.phtml/.phar/.php5/.shtml):"
+    echo "  $SEV_HIGH Files with executable PHP extensions (.php7/.phtml/.phar/.php5/.shtml):"
     echo "$xphp" | sed 's/^/       /'
-    issues=1
+    score_add 10 "Executable non-.php extension file(s) found"; issues=1
   fi
 
-  # B) PHP SIGNATURES -- eval/assert/base64/shell etc.
-  #    Search entire site (plugins, themes, uploads, root).
-  #    Exclude wp-includes & wp-admin -- covered by core diff/checksums.
-  local php_sig
-  php_sig="$(grep -RIlE --include='*.php' "$DANGER_PATTERNS" \
+  # A2) SHA256 -- known webshell hash match (zero false positives)
+  if [ -f "$KNOWN_SHELLS_FILE" ]; then
+    echo "  -- SHA256 known webshell check --"
+    find "$WPP" -type f -name '*.php' 2>/dev/null | while IFS= read -r f; do
+      local shell_name; shell_name="$(check_known_shell "$f")"
+      if [ -n "$shell_name" ]; then
+        echo "  $SEV_CRITICAL Known webshell match: $f"
+        echo "        Shell: $shell_name"
+        score_add 25 "Known webshell SHA256 match: $shell_name ($f)"; issues=1
+      fi
+    done
+  fi
+
+  # B) PHP -- recently modified AND containing suspicious patterns (combined to cut false positives)
+  #    Files must satisfy BOTH conditions: modified after SINCE_DATE AND match DANGER_PATTERNS.
+  #    Excludes wp-includes & wp-admin (covered by core diff/checksums).
+  local php_combined
+  mapfile -t php_combined < <(
+    find "$CONTENT" "$WPP"/*.php 2>/dev/null \
+      -type f -name '*.php' -newermt "$SINCE_DATE" 2>/dev/null \
+    | grep -vE '/(wp-includes|wp-admin)/' \
+    | while IFS= read -r f; do
+        hits="$(grep -nEi "$DANGER_PATTERNS" "$f" 2>/dev/null | head -3)"
+        [ -n "$hits" ] && printf '%s\n%s\n---\n' "$f" "$hits"
+      done
+  )
+  if [ ${#php_combined[@]} -gt 0 ]; then
+    local cur_file=""
+    for line in "${php_combined[@]}"; do
+      if [ "$line" = "---" ]; then
+        cur_file=""
+      elif [ -z "$cur_file" ]; then
+        cur_file="$line"
+        if echo "$cur_file" | grep -q '/uploads/'; then
+          echo "  $SEV_CRITICAL $cur_file  (PHP in uploads/ + suspicious pattern)"
+        else
+          echo "  $SEV_HIGH $cur_file  (modified after $SINCE_DATE + suspicious pattern)"
+        fi
+        issues=1
+      else
+        echo "        >> $line"
+      fi
+    done
+  fi
+
+  # B2) PHP with suspicious patterns but NOT recently modified -- lower priority, info only
+  local php_old_sig
+  php_old_sig="$(grep -RIlE --include='*.php' "$DANGER_PATTERNS" \
       "$CONTENT" "$WPP"/*.php 2>/dev/null \
     | grep -vE '/(wp-includes|wp-admin)/' \
-    | head -60)"
-  if [ -n "$php_sig" ]; then
-    echo "  [?] PHP with suspicious patterns (check context -- possible false positives):"
-    echo "$php_sig" | sed 's/^/       /'
-    # Separate uploads/ hits -- PHP never belongs there
-    local php_sig_up
-    php_sig_up="$(echo "$php_sig" | grep '/uploads/')"
-    if [ -n "$php_sig_up" ]; then
-      echo "  [!] Among those, inside uploads/ (DEFINITELY suspicious):"
-      echo "$php_sig_up" | sed 's/^/       /'
-      issues=1
-    fi
+    | while IFS= read -r f; do
+        find "$f" -newermt "$SINCE_DATE" 2>/dev/null | grep -q . && continue
+        echo "$f"
+      done \
+    | head -30)"
+  if [ -n "$php_old_sig" ]; then
+    echo "  $SEV_LOW PHP with suspicious patterns (NOT recently modified -- likely false positives):"
+    echo "$php_old_sig" | sed 's/^/       /'
   fi
 
   # C) .HTACCESS -- dangerous directives (distinguishes protective vs malicious)
   local htaccess_files
   mapfile -t htaccess_files < <(find "$WPP" -name '.htaccess' -type f 2>/dev/null)
   for hta in "${htaccess_files[@]}"; do
-    # DANGER: AddType (executes other extensions as PHP), auto_prepend/append (inject),
-    #           RewriteRule pointing to uploads or external URL
     local hta_danger
     hta_danger="$(grep -inE \
       'AddType\s+application/x-httpd-php|auto_prepend_file|auto_append_file|php_value\s+auto_prepend|RewriteRule.*uploads.*\.(php|phtml|phar)|RewriteRule.*http[s]?://' \
       "$hta" 2>/dev/null)"
     if [ -n "$hta_danger" ]; then
-      echo "  [!] DANGEROUS directives in ${hta#$WPP/}:"
+      echo "  $SEV_HIGH DANGEROUS directives in ${hta#$WPP/}:"
       echo "$hta_danger" | sed 's/^/       >> /'
-      issues=1
+      score_add 10 "Dangerous .htaccess directive in ${hta#$WPP/}"; issues=1
     fi
 
-    # PROTECTIVE (OK): php_flag engine off -- blocks PHP execution, set by plugins
     local hta_protective
     hta_protective="$(grep -inE 'php_flag\s+engine\s+off' "$hta" 2>/dev/null)"
-    if [ -n "$hta_protective" ]; then
-      echo "  [ok] Protective directive in ${hta#$WPP/} (php_flag engine off -- normal, set by plugins like Sucuri/WPForms)"
-    fi
+    [ -n "$hta_protective" ] && \
+      echo "  $SEV_INFO Protective directive in ${hta#$WPP/} (php_flag engine off -- set by Sucuri/WPForms)"
 
-    # INFORMATIONAL: other php_flag/php_value entries that are not engine off
     local hta_phpflag
     hta_phpflag="$(grep -inE 'php_flag|php_value' "$hta" 2>/dev/null \
                   | grep -ivE 'php_flag\s+engine\s+off')"
     if [ -n "$hta_phpflag" ]; then
-      echo "  [?] php_flag/php_value in ${hta#$WPP/} (check context):"
+      echo "  $SEV_LOW php_flag/php_value in ${hta#$WPP/} (check context):"
       echo "$hta_phpflag" | sed 's/^/       /'
     fi
   done
 
-  # D) JS/HTML -- malicious JavaScript signatures
-  #    eval(atob(...)) / document.write(unescape(...)) / obfuscated hex strings /
-  #    external src loading scripts from unknown domains
-  local js_sig
-  js_sig="$(grep -RIlE --include='*.js' --include='*.html' --include='*.htm' \
-      'eval\s*\(\s*atob\s*\(|eval\s*\(\s*unescape\s*\(|document\.write\s*\(\s*unescape|String\.fromCharCode\s*\([0-9,\s]{40,}\)|\\\\x[0-9a-f]{2}\\\\x[0-9a-f]{2}\\\\x[0-9a-f]{2}|fetch\s*\(\s*['"'"'"][^'"'"'"]{0,5}https?://[^/]|src\s*=\s*['"'"'"]https?://(?!ajax\.googleapis|cdnjs\.cloudflare|code\.jquery|cdn\.jsdelivr|fonts\.googleapis|use\.fontawesome)' \
-      "$CONTENT" 2>/dev/null | head -40)"
-  if [ -n "$js_sig" ]; then
-    echo "  [?] JS/HTML with suspicious patterns (obfuscation, external script src):"
-    echo "$js_sig" | sed 's/^/       /'
-    issues=1
+  # D) JS/HTML -- recently modified AND matching malicious patterns (combined)
+  local js_combined
+  js_combined="$(
+    find "$CONTENT" -type f \( -name '*.js' -o -name '*.html' -o -name '*.htm' \) \
+      -newermt "$SINCE_DATE" 2>/dev/null \
+    | while IFS= read -r f; do
+        hits="$(grep -nEi \
+          'eval\s*\(\s*atob\s*\(|eval\s*\(\s*unescape\s*\(|document\.write\s*\(\s*unescape|String\.fromCharCode\s*\([0-9,\s]{40,}\)' \
+          "$f" 2>/dev/null | head -2)"
+        [ -n "$hits" ] && echo "$f" && echo "$hits" | sed 's/^/       >> /'
+      done | head -60
+  )"
+  if [ -n "$js_combined" ]; then
+    echo "  $SEV_MEDIUM JS/HTML modified after $SINCE_DATE AND matching obfuscation patterns:"
+    echo "$js_combined" | sed 's/^/       /'
+    score_add 10 "JS/HTML obfuscation pattern in recently modified file"; issues=1
   fi
 
-  # E) NEW/MODIFIED files after 15/07/2026
-  #    PHP -- excluding wp-includes & wp-admin (covered by core diff)
-  local new_php
-  new_php="$(find "$CONTENT" "$WPP"/*.php 2>/dev/null \
-              -type f -name '*.php' -newermt '2026-07-15' \
-              -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null | head -40)"
-  [ -n "$new_php" ] && {
-    echo "  [?] PHP modified after 15/07 (wp-content + root):"
-    echo "$new_php" | sed 's/^/       /'
-  }
+  # D2) External C2 / exfiltration URLs inside PHP, JS, HTML
+  local c2_hits
+  c2_hits="$(grep -RInE --include='*.php' --include='*.js' --include='*.html' --include='*.htm' \
+    "$C2_PATTERNS" "$WPP" 2>/dev/null | head -20)"
+  if [ -n "$c2_hits" ]; then
+    echo "  $SEV_CRITICAL External C2/exfiltration URL found in source files:"
+    echo "$c2_hits" | sed 's/^/       /'
+    score_add 15 "External C2/exfiltration URL in PHP/JS/HTML"; issues=1
+  fi
 
-  #    JS/HTML -- new or modified
-  local new_js
-  new_js="$(find "$CONTENT" -type f \( -name '*.js' -o -name '*.html' -o -name '*.htm' \) \
-              -newermt '2026-07-15' \
-              -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null | head -40)"
-  [ -n "$new_js" ] && {
-    echo "  [?] JS/HTML modified after 15/07:"
-    echo "$new_js" | sed 's/^/       /'
-  }
-
-  #    .htaccess -- modified
+  # E) .htaccess modified after SINCE_DATE
   local new_hta
-  new_hta="$(find "$WPP" -name '.htaccess' -newermt '2026-07-15' \
+  new_hta="$(find "$WPP" -name '.htaccess' -newermt "$SINCE_DATE" \
               -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null)"
-  [ -n "$new_hta" ] && {
-    echo "  [!] .htaccess modified after 15/07:"
+  if [ -n "$new_hta" ]; then
+    echo "  $SEV_MEDIUM .htaccess modified after $SINCE_DATE:"
     echo "$new_hta" | sed 's/^/       /'
-    issues=1
-  }
+    score_add 5 ".htaccess modified after $SINCE_DATE"; issues=1
+  fi
 
   # F) IMAGES WITH PHP PAYLOAD -- polyglot files
-  #    Search for literal "<?php" inside jpg/png/gif/ico/webp
   local img_php
   img_php="$(grep -RIla --include='*.jpg' --include='*.jpeg' \
                --include='*.png' --include='*.gif' --include='*.ico' \
                --include='*.webp' \
                '<?php' "$CONTENT/uploads" 2>/dev/null | head -20)"
   if [ -n "$img_php" ]; then
-    echo "  [!] Images containing PHP code (polyglot payload):"
+    echo "  $SEV_CRITICAL Images containing PHP code (polyglot payload):"
     echo "$img_php" | sed 's/^/       /'
-    issues=1
+    score_add 25 "Polyglot image with PHP payload in uploads/"; issues=1
   fi
 
   # G) EXPOSED BACKUP/CONFIG files -- web-accessible
@@ -256,9 +378,9 @@ scan_files() {
                -o -name '*.sql.gz' -o -name 'database.sql' \
              \) 2>/dev/null)"
   if [ -n "$exposed" ]; then
-    echo "  [!] Exposed backup/config files (web-accessible!):"
+    echo "  $SEV_MEDIUM Exposed backup/config files (web-accessible!):"
     echo "$exposed" | sed 's/^/       /'
-    issues=1
+    score_add 5 "Exposed backup/config file(s) in webroot"; issues=1
   fi
 
   return $issues
@@ -268,20 +390,22 @@ scan_files() {
 # Returns 0 if clean, 1 if anything found.
 scan_site() {
   local owner="$1" WPP="$2" issues=0
+  score_reset
   echo "----------------------------------------------"
   echo "SITE: $WPP"
 
   local ver; ver="$(run_wp "$owner" "$WPP" core version)"
   if [ -z "$ver" ]; then
-    echo "  [?] Could not read version/DB -- skipping."
+    echo "  $SEV_INFO Could not read version/DB -- skipping."
     return 0
   fi
-  echo "  WordPress version: $ver"
+  echo "  $SEV_INFO WordPress version: $ver"
   case "$ver" in
     6.8.[6-9]*|6.9.[5-9]*|6.9.[1-9][0-9]*|7.0.[2-9]*|7.[1-9]*|[89].*)
-      echo "  [ok] Patched version." ;;
+      echo "  $SEV_OK Patched version." ;;
     *)
-      echo "  [!] VULNERABLE version -- update to 6.8.6 / 6.9.5 / 7.0.2+"; issues=1 ;;
+      echo "  $SEV_HIGH VULNERABLE version -- update to 6.8.6 / 6.9.5 / 7.0.2+"
+      score_add 20 "Vulnerable WordPress version ($ver)"; issues=1 ;;
   esac
 
   # 1) Account fingerprints
@@ -289,7 +413,9 @@ scan_site() {
   bad="$(run_wp "$owner" "$WPP" user list --fields=ID,user_login,user_email,user_registered,roles --format=csv \
          | grep -Ei 'wp2_[0-9a-f]{6,}|@wp2shell\.invalid')"
   if [ -n "$bad" ]; then
-    echo "  [!] wp2shell fingerprint accounts found:"; echo "$bad" | sed 's/^/       /'; issues=1
+    echo "  $SEV_CRITICAL wp2shell fingerprint accounts found:"
+    echo "$bad" | sed 's/^/       /'
+    score_add 40 "wp2shell fingerprint account (wp2_/@wp2shell.invalid)"; issues=1
   fi
 
   # 2) Admins created after disclosure (15/07/2026)
@@ -298,7 +424,9 @@ scan_site() {
             --fields=ID,user_login,user_email,user_registered --format=csv \
             | awk -F, 'NR>1 && $4>"2026-07-15"{print}')"
   if [ -n "$newadm" ]; then
-    echo "  [!] New admins created after disclosure (15/07/2026):"; echo "$newadm" | sed 's/^/       /'; issues=1
+    echo "  $SEV_MEDIUM New admins created after disclosure (15/07/2026):"
+    echo "$newadm" | sed 's/^/       /'
+    score_add 10 "New admin created after disclosure date"; issues=1
   fi
 
   # 3) Orphaned usermeta / gaps in user-ID sequence
@@ -306,21 +434,29 @@ scan_site() {
   orphan="$(run_wp "$owner" "$WPP" db query \
     "SELECT COUNT(*) FROM wp_usermeta um LEFT JOIN wp_users u ON um.user_id=u.ID WHERE u.ID IS NULL;" \
     --skip-column-names)"
-  [ "${orphan:-0}" -gt 0 ] 2>/dev/null && { echo "  [!] Orphaned usermeta rows: $orphan"; issues=1; }
+  [ "${orphan:-0}" -gt 0 ] 2>/dev/null && {
+    echo "  $SEV_MEDIUM Orphaned usermeta rows: $orphan (traces of deleted user)"
+    score_add 5 "Orphaned usermeta rows ($orphan)"; issues=1
+  }
 
   # 4) PHP files in uploads
   local phpup
   phpup="$(find "$WPP/wp-content/uploads" -type f -name '*.php' 2>/dev/null)"
-  [ -n "$phpup" ] && { echo "  [!] PHP files inside uploads/:"; echo "$phpup" | sed 's/^/       /'; issues=1; }
+  if [ -n "$phpup" ]; then
+    echo "  $SEV_CRITICAL PHP files inside uploads/:"
+    echo "$phpup" | sed 's/^/       /'
+    score_add 30 "PHP file(s) inside uploads/"; issues=1
+  fi
 
   # 5) Core checksums (locale-aware, from wp.org)
   local cks
   cks="$(run_wp "$owner" "$WPP" core verify-checksums 2>&1)"
   if echo "$cks" | grep -qi 'Success'; then
-    echo "  [ok] Core checksums OK."
+    echo "  $SEV_OK Core checksums OK."
   else
-    echo "  [!] Core checksums FAILED:"
-    echo "$cks" | grep -Ei 'Warning|does not|should not' | sed 's/^/       /'; issues=1
+    echo "  $SEV_HIGH Core checksums FAILED:"
+    echo "$cks" | grep -Ei 'Warning|does not|should not' | sed 's/^/       /'
+    score_add 5 "Core checksum failure (modified/extra core files)"; issues=1
   fi
 
   # 6) CORE DIFF -- line-by-line with per-file evaluation
@@ -363,7 +499,7 @@ scan_site() {
     )
 
     if [ "${#changed_files[@]}" -eq 0 ] && [ "${#extra_files[@]}" -eq 0 ]; then
-      echo "  [ok] Core diff clean -- no modified or extra files."
+      echo "  $SEV_OK Core diff clean -- no modified or extra files."
     else
       echo "  -- Core diff: ${#changed_files[@]} modified, ${#extra_files[@]} extra files --"
 
@@ -390,7 +526,8 @@ scan_site() {
         if echo "$added" | grep -qiE "$DANGER_PATTERNS"; then
           verdict="DANGER"
           pattern_matched=1
-          echo "  │  [!] Assessment (patterns): [DANGER] -- executable/obfuscated pattern found in added lines"
+          echo "  │  $SEV_CRITICAL Assessment (patterns): executable/obfuscated pattern found in added lines"
+          score_add 20 "Core file modified with dangerous pattern: $rel"
         fi
 
         # SAFE: only whitespace/comment/version string changes
@@ -405,7 +542,7 @@ scan_site() {
           if [ -z "$non_trivial" ]; then
             verdict="OK"
             pattern_matched=1
-            echo "  │  [ok] Assessment (patterns): [OK] -- only whitespace/comment/version changes"
+            echo "  │  $SEV_OK Assessment (patterns): only whitespace/comment/version changes"
           fi
         fi
 
@@ -427,18 +564,23 @@ scan_site() {
           if [ -n "$ai_response" ]; then
             ai_verdict="${ai_response%%|||*}"
             ai_reason="${ai_response##*|||}"
-            echo "  │  [AI] Assessment: [$ai_verdict] -- $ai_reason"
+            case "$ai_verdict" in
+              DANGER)     echo "  │  $SEV_CRITICAL Assessment (AI): $ai_reason" ;;
+              SUSPICIOUS) echo "  │  $SEV_HIGH Assessment (AI): $ai_reason" ;;
+              REVIEW)     echo "  │  $SEV_MEDIUM Assessment (AI): $ai_reason" ;;
+              *)          echo "  │  $SEV_OK Assessment (AI): $ai_reason" ;;
+            esac
             verdict="$ai_verdict"
           else
-            echo "  │  [?] Assessment (AI): [FAILED] -- no response, check manually"
+            echo "  │  $SEV_MEDIUM Assessment (AI): no response -- check manually"
             verdict="REVIEW"
           fi
         elif [ "$pattern_matched" -eq 0 ]; then
-          echo "  │  [?] Assessment (AI): [SKIPPED] -- AI disabled, check manually"
+          echo "  │  $SEV_LOW Assessment (AI): skipped (AI disabled) -- check manually"
           verdict="REVIEW"
         fi
 
-        # If DANGER or SUSPICIOUS → flag for the email
+        # If DANGER or SUSPICIOUS -- flag for the email
         case "$verdict" in DANGER|SUSPICIOUS|REVIEW) issues=1 ;; esac
 
         # Print diff with prefix for readability
@@ -586,8 +728,60 @@ scan_site() {
          -printf '%TY-%Tm-%Td %TH:%TM  %p\n' | head -30)"
   [ -n "$rec" ] && { echo "  [?] Core PHP modified after 15/07/2026:"; echo "$rec" | sed 's/^/       /'; }
 
-  # 8) Extended file scan: PHP/JS/HTML/htaccess/images/backups
+  # 8) WP Options -- check for tampered critical options
+  echo "  -- WP Options check --"
+  local opt_siteurl opt_home opt_upload opt_prepend
+  opt_siteurl="$(run_wp "$owner" "$WPP" option get siteurl 2>/dev/null)"
+  opt_home="$(run_wp "$owner" "$WPP" option get home 2>/dev/null)"
+  opt_upload="$(run_wp "$owner" "$WPP" option get upload_path 2>/dev/null)"
+  opt_prepend="$(run_wp "$owner" "$WPP" option get auto_prepend_file 2>/dev/null)"
+
+  # Flag upload_path if set outside wp-content/uploads
+  if [ -n "$opt_upload" ] && ! echo "$opt_upload" | grep -qE 'wp-content/uploads|^$'; then
+    echo "  $SEV_HIGH upload_path redirected outside wp-content/uploads: $opt_upload"
+    score_add 15 "upload_path tampered: $opt_upload"; issues=1
+  fi
+  # Flag auto_prepend_file if set at all (injects PHP into every request)
+  if [ -n "$opt_prepend" ]; then
+    echo "  $SEV_CRITICAL auto_prepend_file set in WP options: $opt_prepend"
+    score_add 25 "auto_prepend_file set in wp_options"; issues=1
+  fi
+  # Flag siteurl/home pointing to unexpected external domain
+  local expected_domain; expected_domain="$(basename "$(dirname "$(dirname "$WPP")")")"
+  if ! echo "$opt_siteurl" | grep -q "$expected_domain"; then
+    echo "  $SEV_HIGH siteurl does not match site directory: $opt_siteurl"
+    score_add 10 "siteurl mismatch: $opt_siteurl"; issues=1
+  fi
+
+  # 9) Cron persistence -- system crontabs for this site's owner
+  echo "  -- Cron persistence check --"
+  local cron_hits
+  cron_hits="$(crontab -u "$owner" -l 2>/dev/null \
+    | grep -vE '^\s*#|^\s*$' \
+    | grep -iE 'curl|wget|php|python|bash|sh |/tmp|/dev/shm|base64')"
+  if [ -n "$cron_hits" ]; then
+    echo "  $SEV_HIGH Suspicious cron entries for user $owner:"
+    echo "$cron_hits" | sed 's/^/       /'
+    score_add 10 "Suspicious cron entry for $owner"; issues=1
+  else
+    echo "  $SEV_OK No suspicious cron entries for $owner."
+  fi
+
+  # Also check /etc/cron.d for entries referencing this site's webroot
+  local syscron
+  syscron="$(grep -rlE "$WPP|/home/$owner" /etc/cron.d /etc/cron.daily \
+               /etc/cron.hourly /etc/cron.weekly 2>/dev/null)"
+  if [ -n "$syscron" ]; then
+    echo "  $SEV_MEDIUM System cron files referencing this site:"
+    echo "$syscron" | sed 's/^/       /'
+    score_add 5 "System cron referencing site path"
+  fi
+
+  # 10) Extended file scan: PHP/JS/HTML/htaccess/images/backups
   scan_files "$WPP" || issues=1
+
+  # Risk score report for this site
+  score_report "$expected_domain"
 
   return $issues
 }
@@ -619,7 +813,16 @@ for user in "${USERS[@]}"; do
     echo "User: $user"
     echo "Server: $(hostname)"
     echo "Date: $(date '+%Y-%m-%d %H:%M')"
-    echo
+    echo "Since date: $SINCE_DATE"
+    echo ""
+    echo "Severity legend:"
+    echo "  [CRITICAL] Active compromise indicator -- act immediately"
+    echo "  [HIGH]     Strong indicator -- review urgently"
+    echo "  [MEDIUM]   Suspicious -- investigate"
+    echo "  [LOW]      Low priority -- likely false positive, verify manually"
+    echo "  [INFO]     Informational"
+    echo "  [OK]       Clean / expected"
+    echo ""
   } >> "$body_file"
 
   for WPP in "${SITES[@]}"; do
