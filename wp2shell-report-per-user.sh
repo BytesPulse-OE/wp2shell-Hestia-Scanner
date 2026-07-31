@@ -86,9 +86,9 @@ finding_file() {
 }
 
 finding_line() {
-  # Truncate long lines to 120 chars for readability
-  local line; line="$(echo "$1" | cut -c1-120)"
-  _FINDING_LINES="${_FINDING_LINES}               > $line\n"
+  # Strip non-printable/binary chars, truncate to 120 chars
+  local line; line="$(printf '%s' "$1" | tr -cd '[:print:]' | cut -c1-120)"
+  [ -n "$line" ] && _FINDING_LINES="${_FINDING_LINES}               > $line\n"
 }
 
 finding_end() {
@@ -754,19 +754,25 @@ scan_site() {
 
         # PHP / executable files -- full analysis
         # Avoid null bytes: check if binary before reading into variable
-        local extra_content=""
+        local extra_content="" is_binary=0
         if file "$extra_file" 2>/dev/null | grep -qE 'text|ASCII|UTF'; then
           extra_content="$(head -100 "$extra_file" 2>/dev/null)"
         else
-          # Binary file -- extract printable strings only for pattern check
+          # Binary file -- use strings only for internal pattern check, never display raw content
           extra_content="$(strings "$extra_file" 2>/dev/null | head -100)"
-          echo "  │  [i] Binary file -- analysing via strings(1)"
+          is_binary=1
         fi
 
         if echo "$extra_content" | grep -qiE "$DANGER_PATTERNS"; then
           finding_start CRITICAL "Extra file with dangerous pattern"
-          while IFS= read -r line; do finding_line "$line"; done < <(grep -nEi "$DANGER_PATTERNS" "$extra_file" 2>/dev/null | head -5 | cut -c1-120)
           finding_file "$rel"
+          # Only show matching lines if text file -- binary lines are already sanitized by finding_line()
+          if [ "$is_binary" -eq 0 ]; then
+            while IFS= read -r line; do finding_line "$line"; done < \
+              <(grep -nEi "$DANGER_PATTERNS" "$extra_file" 2>/dev/null | head -5 | cut -c1-120)
+          else
+            finding_line "[binary file -- dangerous pattern detected via strings analysis]"
+          fi
           finding_end
           score_add 15 "Extra PHP file with dangerous pattern: $rel"; issues=1
         elif echo "$extra_content" | grep -qiE '<\?php'; then
@@ -774,15 +780,22 @@ scan_site() {
           finding_file "$rel"
           finding_end
           score_add 5 "Extra PHP file outside core: $rel"; issues=1
+        else
           finding_ok "Extra file: no PHP or suspicious code"
         fi
 
-        # Print file content
+        # Print file content -- text files only, truncated and sanitized
         echo "  │"
-        echo "  │  Content (first 40 lines):"
-        head -40 "$extra_file" 2>/dev/null | sed 's/^/  │    /'
-        local ex_lines; ex_lines="$(wc -l < "$extra_file" 2>/dev/null)"
-        [ "${ex_lines:-0}" -gt 40 ] && echo "  │  ... ($(( ex_lines - 40 )) more lines -- path: $extra_file)"
+        if [ "$is_binary" -eq 1 ]; then
+          echo "  │  [binary file -- content not displayed]"
+        else
+          echo "  │  Content (first 20 lines):"
+          head -20 "$extra_file" 2>/dev/null \
+            | tr -cd '[:print:]\n' \
+            | sed 's/^/  │    /'
+          local ex_lines; ex_lines="$(wc -l < "$extra_file" 2>/dev/null)"
+          [ "${ex_lines:-0}" -gt 20 ] && echo "  │  ... ($(( ex_lines - 20 )) more lines -- path: $extra_file)"
+        fi
         echo "  └──────────────────────────────────────"
       done
     fi
