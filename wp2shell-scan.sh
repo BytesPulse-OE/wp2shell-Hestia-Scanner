@@ -64,8 +64,8 @@ finding_file() {
 }
 
 finding_line() {
-  local line; line="$(echo "$1" | cut -c1-120)"
-  _FINDING_LINES="${_FINDING_LINES}               > $line\n"
+  local line; line="$(printf '%s' "$1" | tr -cd '[:print:]' | cut -c1-120)"
+  [ -n "$line" ] && _FINDING_LINES="${_FINDING_LINES}               > $line\n"
 }
 
 finding_end() {
