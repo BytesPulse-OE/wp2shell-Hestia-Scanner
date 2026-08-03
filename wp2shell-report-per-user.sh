@@ -181,7 +181,13 @@ else
 fi
 echo ""
 
-# Global: dangerous PHP patterns -- used by scan_site AND scan_files
+# TIER 1 -- almost always malicious regardless of context
+DANGER_HIGH='eval\s*\(\s*\$_|eval\s*\(\s*base64_decode\s*\(|eval\s*\(\s*gz|eval\s*\(\s*str_rot13|assert\s*\(\s*\$_|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|create_function\s*\(|move_uploaded_file\s*\(\s*\$_|php://input'
+
+# TIER 2 -- only suspicious when combined with user input on same line
+DANGER_WITH_INPUT='(eval|assert|base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13)\s*\(.*\$_(POST|GET|REQUEST|COOKIE|SERVER|FILES)'
+
+# TIER 3 -- broad scan, used only for low-priority informational check
 DANGER_PATTERNS='eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|gzuncompress\s*\(|gzdecode\s*\(|assert\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|php://input|create_function\s*\(|preg_replace.*\/e[^a-z]|move_uploaded_file\s*\(|str_rot13\s*\('
 
 # External C2 / exfiltration domains to flag inside PHP/JS/HTML
@@ -231,6 +237,7 @@ score_reset() {
 score_add() {
   local pts="$1" reason="$2"
   SITE_SCORE=$(( SITE_SCORE + pts ))
+  [ "$SITE_SCORE" -gt 100 ] && SITE_SCORE=100
   SITE_SCORE_LOG="${SITE_SCORE_LOG}  $(printf '%+d' "$pts")  $reason\n"
 }
 
@@ -306,16 +313,19 @@ scan_files() {
     done < <(find "$WPP" -type f -name '*.php' 2>/dev/null)
   fi
 
-  # B) PHP -- recently modified AND containing suspicious patterns (combined to cut false positives)
-  #    Files must satisfy BOTH conditions: modified after SINCE_DATE AND match DANGER_PATTERNS.
-  #    Excludes wp-includes & wp-admin (covered by core diff/checksums).
-  local php_combined
+  # B) PHP -- recently modified AND containing dangerous patterns (tiered)
+  #    TIER 1: always suspicious (eval($_POST, shell_exec, etc.)
+  #    TIER 2: suspicious only with user input on same line
+  #    Both exclude comments to reduce false positives.
+  local php_combined php_hit_count=0
   mapfile -t php_combined < <(
     find "$CONTENT" "$WPP"/*.php 2>/dev/null \
       -type f -name '*.php' -newermt "$SINCE_DATE" 2>/dev/null \
     | grep -vE '/(wp-includes|wp-admin)/' \
     | while IFS= read -r f; do
-        hits="$(grep -nEi "$DANGER_PATTERNS" "$f" 2>/dev/null | head -3)"
+        # Tier 1 + Tier 2, skip comment lines
+        hits="$(grep -nEi "$DANGER_HIGH|$DANGER_WITH_INPUT" "$f" 2>/dev/null \
+          | grep -vE '^\s*[0-9]+:\s*[/*#]|//[^$]*$' | head -3)"
         [ -n "$hits" ] && printf '%s\n%s\n---\n' "$f" "$hits"
       done
   )
@@ -327,20 +337,25 @@ scan_files() {
         cur_file=""
       elif [ -z "$cur_file" ]; then
         cur_file="$line"
+        php_hit_count=$(( php_hit_count + 1 ))
         if echo "$cur_file" | grep -q '/uploads/'; then
-          finding_start CRITICAL "PHP in uploads/ with suspicious pattern"
+          finding_start CRITICAL "PHP in uploads/ with dangerous pattern"
         else
-          finding_start HIGH "PHP modified after $SINCE_DATE with suspicious pattern"
+          finding_start HIGH "PHP modified after $SINCE_DATE with dangerous pattern"
         fi
         finding_file "${cur_file#$WPP/}"
         issues=1
+        # Diminishing returns: first 3 files score, rest don't
+        if [ "$php_hit_count" -le 3 ]; then
+          score_add 15 "PHP modified after $SINCE_DATE + dangerous pattern"
+        fi
       else
         finding_line "$line"
       fi
     done
   fi
 
-  # B2) PHP with suspicious patterns but NOT recently modified -- lower priority, info only
+  # B2) TIER 3 broad patterns NOT recently modified -- informational only
   local php_old_sig
   php_old_sig="$(grep -RIlE --include='*.php' "$DANGER_PATTERNS" \
       "$CONTENT" "$WPP"/*.php 2>/dev/null \
@@ -351,7 +366,7 @@ scan_files() {
       done \
     | head -30)"
   if [ -n "$php_old_sig" ]; then
-    finding_start LOW "PHP with suspicious patterns -- NOT recently modified (likely false positives)"
+    finding_start LOW "PHP with broad patterns -- NOT recently modified (likely false positives)"
     while IFS= read -r f; do [ -n "$f" ] && finding_file "${f#$WPP/}"; done <<< "$php_old_sig"
     finding_end
   fi
@@ -411,9 +426,8 @@ scan_files() {
   local c2_hits
   c2_hits="$(grep -RInE --include='*.php' --include='*.js' --include='*.html' --include='*.htm' \
     "$C2_PATTERNS" "$WPP" 2>/dev/null \
-    | grep -vE '^\S+:\s*[[:space:]]*(//|#|\*|/\*).*$' \
-    | grep -vE '@see\s+https?://' \
-    | grep -vE '^\s*\*.*https?://' \
+    | grep -vE '@see\s+https?://|[[:space:]]*//' \
+    | grep -vE '^\S+:[0-9]+:\s*(\/\/|\*|#)' \
     | cut -c1-120 \
     | head -10)"
   if [ -n "$c2_hits" ]; then
@@ -621,8 +635,8 @@ scan_site() {
         local verdict=""
         local pattern_matched=0
 
-        # DANGEROUS patterns in ADDED lines (uses global DANGER_PATTERNS)
-        if echo "$added" | grep -qiE "$DANGER_PATTERNS"; then
+        # DANGEROUS patterns in ADDED lines -- use TIER 1 (high confidence only)
+        if echo "$added" | grep -qiE "$DANGER_HIGH"; then
           verdict="DANGER"
           pattern_matched=1
           finding_start CRITICAL "Core file modified with dangerous pattern"
