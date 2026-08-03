@@ -433,7 +433,7 @@ for WPP in "${WP_PATHS[@]}"; do
 
   # --- 13) PHP modified after SINCE_DATE AND matching patterns ---------------
   hdr "PHP pattern analysis"
-  local php_hit_count=0
+  php_hit_count=0
   while IFS= read -r f; do
     # Tier 1: always malicious -- flag immediately as HIGH/CRITICAL
     hits_t1="$(grep -nEi "$DANGER_HIGH" "$f" 2>/dev/null \
@@ -442,8 +442,7 @@ for WPP in "${WP_PATHS[@]}"; do
     hits_t2="$(grep -nEi "$DANGER_WITH_INPUT" "$f" 2>/dev/null \
       | grep -vE '^\s*[/*#]|//.*$' | head -3 | cut -c1-120)"
 
-    hits="$hits_t1"$'\n'"$hits_t2"
-    hits="$(echo "$hits" | sed '/^$/d')"
+    hits="$(printf '%s\n%s' "$hits_t1" "$hits_t2" | sed '/^[[:space:]]*$/d')"
 
     if [ -n "$hits" ]; then
       php_hit_count=$(( php_hit_count + 1 ))
@@ -455,7 +454,7 @@ for WPP in "${WP_PATHS[@]}"; do
       finding_file "${f#$WPP/}"
       while IFS= read -r line; do [ -n "$line" ] && finding_line "$line"; done <<< "$hits"
       finding_end
-      # Score: first hit +15, diminishing returns after that, cap total at 100
+      # Score: first 3 hits +15 each, diminishing returns after that, cap at 100
       if [ "$php_hit_count" -le 3 ]; then
         score_add 15 "PHP modified after $SINCE_DATE + dangerous pattern: ${f#$WPP/}"
       fi
