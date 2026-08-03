@@ -30,7 +30,15 @@ FOUND_ANY=0
 # ---------------------------------------------------------------------------
 # Global patterns
 # ---------------------------------------------------------------------------
+# TIER 1 -- almost always malicious regardless of context
+DANGER_HIGH='eval\s*\(\s*\$_|eval\s*\(\s*base64_decode\s*\(|eval\s*\(\s*gz|eval\s*\(\s*str_rot13|assert\s*\(\s*\$_|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|create_function\s*\(|move_uploaded_file\s*\(\s*\$_|php://input'
+
+# TIER 2 -- only suspicious when combined with user input on same line
+DANGER_WITH_INPUT='(eval|assert|base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13)\s*\(.*\$_(POST|GET|REQUEST|COOKIE|SERVER|FILES)'
+
+# TIER 3 -- broad scan, used only for low-priority informational check
 DANGER_PATTERNS='eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|gzuncompress\s*\(|gzdecode\s*\(|assert\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|php://input|create_function\s*\(|preg_replace.*\/e[^a-z]|move_uploaded_file\s*\(|str_rot13\s*\('
+
 C2_PATTERNS='pastebin\.com/raw|gist\.github\.com/raw|raw\.githubusercontent\.com/|t\.me/|discord(app)?\.com/api/webhooks|ngrok\.io|ngrok-free\.app|tinyurl\.com|bit\.ly/[a-zA-Z0-9]|cdn\.discordapp\.com'
 
 # ---------------------------------------------------------------------------
@@ -106,6 +114,7 @@ score_reset() { SITE_SCORE=0; SITE_SCORE_LOG=""; }
 
 score_add() {
   SITE_SCORE=$(( SITE_SCORE + $1 ))
+  [ "$SITE_SCORE" -gt 100 ] && SITE_SCORE=100
   SITE_SCORE_LOG="${SITE_SCORE_LOG}$(printf '  %+d  %s\n' "$1" "$2")"$'\n'
 }
 
@@ -410,7 +419,8 @@ for WPP in "${WP_PATHS[@]}"; do
   c2_hits="$(grep -RInE --include='*.php' --include='*.js' --include='*.html' \
     "$C2_PATTERNS" \
     "$WPP/wp-content" 2>/dev/null \
-    | grep -vE '@see\s+https?://|^\s*[*#/].*https?://' \
+    | grep -vE '@see\s+https?://|[[:space:]]*//' \
+    | grep -vE '^\S+:[0-9]+:\s*(\/\/|\*|#)' \
     | cut -c1-120 | head -10)"
   if [ -n "$c2_hits" ]; then
     finding_start CRITICAL "External C2/exfiltration URL in source files"
@@ -423,23 +433,37 @@ for WPP in "${WP_PATHS[@]}"; do
 
   # --- 13) PHP modified after SINCE_DATE AND matching patterns ---------------
   hdr "PHP pattern analysis"
+  local php_hit_count=0
   while IFS= read -r f; do
-    hits="$(grep -nEi "$DANGER_PATTERNS" "$f" 2>/dev/null | head -3 | cut -c1-120)"
+    # Tier 1: always malicious -- flag immediately as HIGH/CRITICAL
+    hits_t1="$(grep -nEi "$DANGER_HIGH" "$f" 2>/dev/null \
+      | grep -vE '^\s*[/*#]|//.*$' | head -3 | cut -c1-120)"
+    # Tier 2: dangerous only with user input on same line
+    hits_t2="$(grep -nEi "$DANGER_WITH_INPUT" "$f" 2>/dev/null \
+      | grep -vE '^\s*[/*#]|//.*$' | head -3 | cut -c1-120)"
+
+    hits="$hits_t1"$'\n'"$hits_t2"
+    hits="$(echo "$hits" | sed '/^$/d')"
+
     if [ -n "$hits" ]; then
+      php_hit_count=$(( php_hit_count + 1 ))
       if echo "$f" | grep -q '/uploads/'; then
-        finding_start CRITICAL "PHP in uploads/ with suspicious pattern"
+        finding_start CRITICAL "PHP in uploads/ with dangerous pattern"
       else
-        finding_start HIGH "PHP modified after $SINCE_DATE with suspicious pattern"
+        finding_start HIGH "PHP modified after $SINCE_DATE with dangerous pattern"
       fi
       finding_file "${f#$WPP/}"
       while IFS= read -r line; do [ -n "$line" ] && finding_line "$line"; done <<< "$hits"
       finding_end
-      score_add 15 "PHP modified after $SINCE_DATE + suspicious pattern"
+      # Score: first hit +15, diminishing returns after that, cap total at 100
+      if [ "$php_hit_count" -le 3 ]; then
+        score_add 15 "PHP modified after $SINCE_DATE + dangerous pattern: ${f#$WPP/}"
+      fi
     fi
   done < <(find "$WPP" -type f -name '*.php' -newermt "$SINCE_DATE" 2>/dev/null \
     | grep -vE '/(wp-includes|wp-admin)/')
 
-  # Low priority: patterns NOT recently modified
+  # Low priority: TIER 3 (broad) patterns NOT recently modified
   while IFS= read -r f; do
     find "$f" -newermt "$SINCE_DATE" 2>/dev/null | grep -q . && continue
     finding_start LOW "Suspicious pattern (not recently modified -- likely false positive)"
