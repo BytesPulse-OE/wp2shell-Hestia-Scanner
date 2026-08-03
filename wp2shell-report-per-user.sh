@@ -25,7 +25,6 @@ CORE_CACHE="/root/wp2shell-cores"        # cache clean cores per version+locale
 SINCE_DATE="2026-07-15"
 WP="wp"
 
-DRY_RUN=1                                # 1 = preview only, 0 = send emails
 SEND_ONLY_IF_ISSUES=0                    # 1 = email only if issues found
 MAIL_FROM="security@$(hostname -f 2>/dev/null || hostname)"
 MAIL_SUBJECT="[wp2shell] Security scan report -- %DOMAINS%"
@@ -116,14 +115,6 @@ finding_info() {
   printf '%s%-10s%s %s\n' "$GRY" "[INFO]" "$RST" "$1"
 }
 
-# Severity prefix strings for legacy inline use (htaccess check etc)
-SEV_CRITICAL="${RED_BOLD}[CRITICAL]${RST}"
-SEV_HIGH="${RED}[HIGH]    ${RST}"
-SEV_MEDIUM="${YEL}[MEDIUM]  ${RST}"
-SEV_LOW="${BLU}[LOW]     ${RST}"
-SEV_INFO="${GRY}[INFO]    ${RST}"
-SEV_OK="${GRN}[OK]      ${RST}"
-
 echo ""
 echo "+------------------------------------------------------+"
 echo "|        wp2shell Security Scanner -- BytesPulse      |"
@@ -194,7 +185,7 @@ echo ""
 DANGER_PATTERNS='eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|gzuncompress\s*\(|gzdecode\s*\(|assert\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|php://input|create_function\s*\(|preg_replace.*\/e[^a-z]|move_uploaded_file\s*\(|str_rot13\s*\('
 
 # External C2 / exfiltration domains to flag inside PHP/JS/HTML
-C2_PATTERNS='pastebin\.com/raw|gist\.github\.com/raw|raw\.githubusercontent\.com|t\.me/|discord(app)?\.com/api/webhooks|ngrok\.io|ngrok-free\.app|tinyurl\.com|bit\.ly/[a-zA-Z0-9]|cdn\.discordapp\.com'
+C2_PATTERNS='pastebin\.com/raw|gist\.github\.com/raw|raw\.githubusercontent\.com/|t\.me/|discord(app)?\.com/api/webhooks|ngrok\.io|ngrok-free\.app|tinyurl\.com|bit\.ly/[a-zA-Z0-9]|cdn\.discordapp\.com'
 
 # Known webshell SHA256 hashes (subset of most common shells)
 # Source: https://github.com/Neo23x0/signature-base + manual curation
@@ -244,20 +235,22 @@ score_add() {
 }
 
 score_report() {
-  local domain="$1"
   local label color
-  if   [ "$SITE_SCORE" -ge 81 ]; then label="COMPROMISED";  color="$RED_BOLD"
-  elif [ "$SITE_SCORE" -ge 61 ]; then label="HIGH RISK";    color="$RED"
-  elif [ "$SITE_SCORE" -ge 41 ]; then label="MEDIUM RISK";  color="$YEL"
-  elif [ "$SITE_SCORE" -ge 21 ]; then label="LOW RISK";     color="$BLU"
+  if   [ "$SITE_SCORE" -ge 81 ]; then label="COMPROMISED";    color="$RED_BOLD"
+  elif [ "$SITE_SCORE" -ge 61 ]; then label="HIGH RISK";      color="$RED"
+  elif [ "$SITE_SCORE" -ge 41 ]; then label="MEDIUM RISK";    color="$YEL"
+  elif [ "$SITE_SCORE" -ge 21 ]; then label="LOW RISK";       color="$BLU"
   else                                 label="PROBABLY CLEAN"; color="$GRN"
   fi
   echo ""
-  echo "  ┌─────────────────────────────────────────┐"
-  printf  "  │  RISK SCORE: %s%-6s%s  %-16s    │\n" "$color" "$SITE_SCORE/100" "$RST" "$label"
-  echo "  │                                         │"
-  printf '%b' "$SITE_SCORE_LOG" | sed 's/^/  │/' | head -15
-  echo "  └─────────────────────────────────────────┘"
+  echo "  +------------------------------------------+"
+  printf "  |  RISK SCORE: %s%-6s%s  %-17s  |\n" "$color" "$SITE_SCORE/100" "$RST" "$label"
+  echo "  +------------------------------------------+"
+  if [ -n "$SITE_SCORE_LOG" ]; then
+    printf '%b' "$SITE_SCORE_LOG" | while IFS= read -r line; do
+      [ -n "$line" ] && echo "  $line"
+    done
+  fi
   echo ""
 }
 
@@ -301,7 +294,7 @@ scan_files() {
 
   # A2) SHA256 -- known webshell hash match (zero false positives)
   if [ -f "$KNOWN_SHELLS_FILE" ]; then
-    find "$WPP" -type f -name '*.php' 2>/dev/null | while IFS= read -r f; do
+    while IFS= read -r f; do
       local shell_name; shell_name="$(check_known_shell "$f")"
       if [ -n "$shell_name" ]; then
         finding_start CRITICAL "Known webshell -- SHA256 hash match"
@@ -310,7 +303,7 @@ scan_files() {
         finding_end
         score_add 25 "Known webshell: $shell_name"; issues=1
       fi
-    done
+    done < <(find "$WPP" -type f -name '*.php' 2>/dev/null)
   fi
 
   # B) PHP -- recently modified AND containing suspicious patterns (combined to cut false positives)
@@ -557,9 +550,9 @@ scan_site() {
     finding_ok "Core checksums OK"
   else
     finding_start HIGH "Core checksum failure -- modified or extra core files"
-    echo "$cks" | grep -Ei 'Warning|does not|should not' | while IFS= read -r line; do
+    while IFS= read -r line; do
       finding_line "$line"
-    done
+    done < <(echo "$cks" | grep -Ei 'Warning|does not|should not')
     finding_end
     score_add 5 "Core checksum failure"; issues=1
   fi
@@ -744,8 +737,8 @@ scan_site() {
             finding_ok "Google Search Console verification file -- OK"
           else
             finding_start MEDIUM "HTML file outside WordPress structure -- review"
-          finding_file "$rel"
-          finding_end
+            finding_file "$rel"
+            finding_end
             issues=1
           fi
           echo "  └──────────────────────────────────────"
@@ -833,7 +826,9 @@ scan_site() {
     score_add 25 "auto_prepend_file in wp_options"; issues=1
   fi
   # Flag siteurl/home pointing to unexpected external domain
-  local expected_domain; expected_domain="$(basename "$(dirname "$(dirname "$WPP")")")"
+  # HestiaCP path: /home/<user>/web/<domain>/public_html
+  # Strip /public_html to get the domain directory
+  local expected_domain; expected_domain="$(basename "$(dirname "$WPP")")"
   # Strip protocol from siteurl before comparing (https://example.com -> example.com)
   local siteurl_domain; siteurl_domain="$(echo "$opt_siteurl" | sed 's|https\?://||' | cut -d'/' -f1)"
   if [ -n "$siteurl_domain" ] && ! echo "$siteurl_domain" | grep -qi "$expected_domain"; then
@@ -842,6 +837,8 @@ scan_site() {
     finding_line "Expected: $expected_domain"
     finding_end
     score_add 10 "siteurl mismatch"; issues=1
+  else
+    finding_ok "WP options look clean"
   fi
 
   # 9) Cron persistence -- system crontabs for this site's owner
@@ -874,7 +871,7 @@ scan_site() {
   scan_files "$WPP" || issues=1
 
   # Risk score report for this site
-  score_report "$expected_domain"
+  score_report
 
   return $issues
 }
@@ -900,8 +897,7 @@ for user in "${USERS[@]}"; do
   body_file="$(mktemp)"
   domains=""
   user_issues=0
-  # findings_file accumulates structured one-liner findings for the email
-  findings_file="$(mktemp)"
+  label=""
 
   {
     echo "=================================================================="
@@ -922,11 +918,10 @@ for user in "${USERS[@]}"; do
   } >> "$body_file"
 
   for WPP in "${SITES[@]}"; do
-    dom="$(basename "$(dirname "$(dirname "$WPP")")")"
+    dom="$(basename "$(dirname "$WPP")")"
     domains="${domains:+$domains, }$dom"
 
-    # Run scan on terminal (verbose), capture structured findings separately
-    > "$findings_file"
+    # Run scan on terminal (verbose)
     scan_site "$user" "$WPP" 2>/dev/null || user_issues=1
 
     # Build structured email section from SITE_SCORE_LOG and issues
@@ -937,7 +932,7 @@ for user in "${USERS[@]}"; do
       echo ""
 
       # Risk score
-      local label
+      label=""
       if   [ "$SITE_SCORE" -ge 81 ]; then label="COMPROMISED"
       elif [ "$SITE_SCORE" -ge 61 ]; then label="HIGH RISK"
       elif [ "$SITE_SCORE" -ge 41 ]; then label="MEDIUM RISK"
@@ -981,8 +976,6 @@ for user in "${USERS[@]}"; do
     echo " Powered by: BytesPulse (https://bytespulse.gr)"
     echo "=================================================================="
   } >> "$body_file"
-
-  rm -f "$findings_file"
 
   # Send or preview
   if [ "$SEND_ONLY_IF_ISSUES" -eq 1 ] && [ "$user_issues" -eq 0 ]; then
