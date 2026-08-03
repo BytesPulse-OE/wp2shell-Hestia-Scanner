@@ -28,6 +28,12 @@ BLU=$'\e[34m'; GRN=$'\e[32m'; GRY=$'\e[90m'; CYA=$'\e[36m'; RST=$'\e[0m'
 FOUND_ANY=0
 
 # ---------------------------------------------------------------------------
+# Global patterns
+# ---------------------------------------------------------------------------
+DANGER_PATTERNS='eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|gzuncompress\s*\(|gzdecode\s*\(|assert\s*\(|shell_exec\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_exec\s*\(|php://input|create_function\s*\(|preg_replace.*\/e[^a-z]|move_uploaded_file\s*\(|str_rot13\s*\('
+C2_PATTERNS='pastebin\.com/raw|gist\.github\.com/raw|raw\.githubusercontent\.com/|t\.me/|discord(app)?\.com/api/webhooks|ngrok\.io|ngrok-free\.app|tinyurl\.com|bit\.ly/[a-zA-Z0-9]|cdn\.discordapp\.com'
+
+# ---------------------------------------------------------------------------
 # Unified finding() output system
 # Same structure for terminal (color) and report file (plain text).
 #
@@ -69,7 +75,9 @@ finding_line() {
 }
 
 finding_end() {
-  [ "$_FINDING_SEV" = "CRITICAL" ] || [ "$_FINDING_SEV" = "HIGH" ] && FOUND_ANY=1
+  if [ "$_FINDING_SEV" = "CRITICAL" ] || [ "$_FINDING_SEV" = "HIGH" ]; then
+    FOUND_ANY=1
+  fi
   local col; col="$(_sev_color "$_FINDING_SEV")"
   local label; label="$(printf '%-10s' "[$_FINDING_SEV]")"
   # Terminal + report file
@@ -299,9 +307,9 @@ for WPP in "${WP_PATHS[@]}"; do
     finding_ok "Core checksums OK"
   else
     finding_start HIGH "Core checksum failure -- modified or extra core files"
-    echo "$cks" | grep -Ei 'Warning|does not|should not exist' | while IFS= read -r line; do
+    while IFS= read -r line; do
       finding_line "$line"
-    done
+    done < <(echo "$cks" | grep -Ei 'Warning|does not|should not exist')
     finding_end
     score_add 5 "Core checksum failure"
   fi
@@ -331,7 +339,9 @@ for WPP in "${WP_PATHS[@]}"; do
   opt_upload="$(run_wp "$owner" "$WPP" option get upload_path 2>/dev/null)"
   opt_prepend="$(run_wp "$owner" "$WPP" option get auto_prepend_file 2>/dev/null)"
   opt_siteurl="$(run_wp "$owner" "$WPP" option get siteurl 2>/dev/null)"
-  expected_domain="$(basename "$(dirname "$(dirname "$WPP")")")"
+  # HestiaCP path: /home/<user>/web/<domain>/public_html
+  # Strip /public_html to get the domain directory
+  expected_domain="$(basename "$(dirname "$WPP")")"
   siteurl_domain="$(echo "$opt_siteurl" | sed 's|https\?://||' | cut -d'/' -f1)"
 
   if [ -n "$opt_upload" ] && ! echo "$opt_upload" | grep -qE 'wp-content/uploads|^$'; then
@@ -382,7 +392,7 @@ for WPP in "${WP_PATHS[@]}"; do
   # --- 11) SHA256 known webshell ---------------------------------------------
   if [ -f "$KNOWN_SHELLS_FILE" ]; then
     hdr "SHA256 webshell check"
-    find "$WPP" -type f -name '*.php' 2>/dev/null | while IFS= read -r f; do
+    while IFS= read -r f; do
       shell_name="$(check_known_shell "$f")"
       if [ -n "$shell_name" ]; then
         finding_start CRITICAL "Known webshell -- SHA256 hash match"
@@ -390,14 +400,15 @@ for WPP in "${WP_PATHS[@]}"; do
         finding_line "Identified as: $shell_name"
         finding_end
         score_add 25 "Known webshell: $shell_name"
+        FOUND_ANY=1
       fi
-    done
+    done < <(find "$WPP" -type f -name '*.php' 2>/dev/null)
   fi
 
   # --- 12) External C2/exfiltration URLs -------------------------------------
   hdr "External C2 URLs"
   c2_hits="$(grep -RInE --include='*.php' --include='*.js' --include='*.html' \
-    'pastebin\.com/raw|gist\.github\.com/raw|raw\.githubusercontent\.com|t\.me/|discord(app)?\.com/api/webhooks|ngrok\.io|ngrok-free\.app|tinyurl\.com|bit\.ly/[a-zA-Z0-9]|cdn\.discordapp\.com' \
+    "$C2_PATTERNS" \
     "$WPP/wp-content" 2>/dev/null \
     | grep -vE '@see\s+https?://|^\s*[*#/].*https?://' \
     | cut -c1-120 | head -10)"
@@ -412,32 +423,31 @@ for WPP in "${WP_PATHS[@]}"; do
 
   # --- 13) PHP modified after SINCE_DATE AND matching patterns ---------------
   hdr "PHP pattern analysis"
-  find "$WPP" -type f -name '*.php' -newermt "$SINCE_DATE" 2>/dev/null \
-  | grep -vE '/(wp-includes|wp-admin)/' \
-  | while IFS= read -r f; do
-      hits="$(grep -nEi "$DANGER_PATTERNS" "$f" 2>/dev/null | head -3 | cut -c1-120)"
-      if [ -n "$hits" ]; then
-        if echo "$f" | grep -q '/uploads/'; then
-          finding_start CRITICAL "PHP in uploads/ with suspicious pattern"
-        else
-          finding_start HIGH "PHP modified after $SINCE_DATE with suspicious pattern"
-        fi
-        finding_file "${f#$WPP/}"
-        while IFS= read -r line; do [ -n "$line" ] && finding_line "$line"; done <<< "$hits"
-        finding_end
-        score_add 15 "PHP modified after $SINCE_DATE + suspicious pattern"
+  while IFS= read -r f; do
+    hits="$(grep -nEi "$DANGER_PATTERNS" "$f" 2>/dev/null | head -3 | cut -c1-120)"
+    if [ -n "$hits" ]; then
+      if echo "$f" | grep -q '/uploads/'; then
+        finding_start CRITICAL "PHP in uploads/ with suspicious pattern"
+      else
+        finding_start HIGH "PHP modified after $SINCE_DATE with suspicious pattern"
       fi
-    done
+      finding_file "${f#$WPP/}"
+      while IFS= read -r line; do [ -n "$line" ] && finding_line "$line"; done <<< "$hits"
+      finding_end
+      score_add 15 "PHP modified after $SINCE_DATE + suspicious pattern"
+    fi
+  done < <(find "$WPP" -type f -name '*.php' -newermt "$SINCE_DATE" 2>/dev/null \
+    | grep -vE '/(wp-includes|wp-admin)/')
 
   # Low priority: patterns NOT recently modified
-  grep -RIlE --include='*.php' "$DANGER_PATTERNS" "$WPP" 2>/dev/null \
-  | grep -vE '/(wp-includes|wp-admin)/' \
-  | while IFS= read -r f; do
-      find "$f" -newermt "$SINCE_DATE" 2>/dev/null | grep -q . && continue
-      finding_start LOW "Suspicious pattern (not recently modified -- likely false positive)"
-      finding_file "${f#$WPP/}"
-      finding_end
-    done | head -60 | tee -a "$REPORT"
+  while IFS= read -r f; do
+    find "$f" -newermt "$SINCE_DATE" 2>/dev/null | grep -q . && continue
+    finding_start LOW "Suspicious pattern (not recently modified -- likely false positive)"
+    finding_file "${f#$WPP/}"
+    finding_end
+  done < <(grep -RIlE --include='*.php' "$DANGER_PATTERNS" "$WPP" 2>/dev/null \
+    | grep -vE '/(wp-includes|wp-admin)/' \
+    | head -30)
 
   # --- Risk Score ------------------------------------------------------------
   score_report
